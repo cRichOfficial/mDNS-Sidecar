@@ -49,12 +49,12 @@ def main() -> None:
 
     print(
         f"\n  NeonBeam Discovery Sidecar\n"
-        f"  ──────────────────────────\n"
+        f"  --------------------------\n"
         f"  Listening on  http://{args.host}:{args.port}\n"
         f"  Health check  http://{args.host}:{args.port}/api/health\n"
         f"  Discovery     http://{args.host}:{args.port}/api/discovery\n"
         f"\n"
-        f"  Vite dev-server proxies /api/discovery → http://localhost:{args.port}\n"
+        f"  Vite dev-server proxies /api/discovery -> http://localhost:{args.port}\n"
         f"  Press Ctrl-C to stop.\n"
     )
 

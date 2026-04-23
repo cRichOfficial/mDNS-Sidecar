@@ -42,4 +42,21 @@ Write-Host ""
 
 $env:DISCOVERY_PORT = $Port
 $env:DISCOVERY_HOST = $BindHost
+
+# Kill any process already listening on the target port so the new instance
+# can bind cleanly.  Without this, a stale process keeps the port and the
+# new uvicorn silently exits (it shows "startup complete" then immediately
+# shuts down — no error, very confusing).
+$existing = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
+    Where-Object State -eq 'Listen' |
+    Select-Object -ExpandProperty OwningProcess -Unique
+if ($existing) {
+    foreach ($procId in $existing) {
+        $pname = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName
+        Write-Host "  Releasing port ${Port}: killing PID $procId ($pname)" -ForegroundColor Yellow
+        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 500   # let the OS reclaim the port
+}
+
 python run.py --host $BindHost --port $Port

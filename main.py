@@ -13,8 +13,8 @@ has no access to the local network's mDNS stack or to localhost on the
 server machine, but this process does.
 Vite dev-server (and nginx in production) proxy /api/discovery here.
 
-Two discovery mechanisms run in parallel
-----------------------------------------
+Three discovery mechanisms run in parallel
+------------------------------------------
 1. Local service probe  — tries http://127.0.0.1:<port>/api/health for
    each well-known NeonBeam port.  If a service is found, the returned URL
    uses the machine's LAN IP (not 127.0.0.1) so that remote clients such
@@ -23,15 +23,14 @@ Two discovery mechanisms run in parallel
 2. mDNS browse          — listens for _http._tcp.local. records tagged with
      service=hardware_comm   (Core Backend)
      service=machine_vision  (Lens Backend)
-   Resolves hostnames found by Avahi/Bonjour on the LAN.
+   Works best when NeonBeam services run with network_mode: host on Linux
+   so their Zeroconf registration reaches the LAN multicast group.
 
-Adding future services
-----------------------
-Each Pi registers an Avahi/zeroconf record with a TXT key:
-    service=hardware_comm   →  Core Backend URL  (neonbeam-core.local)
-    service=machine_vision  →  Lens Backend URL  (neonbeam-lens.local)
-When a new Pi comes online it simply sets its TXT record; no sidecar or
-frontend changes are needed.
+3. /24 subnet scan      — concurrent TCP probe of every host on the local
+   subnet followed by HTTP /api/health verification.  Finds any NeonBeam
+   service regardless of mDNS advertising or Docker network mode.  This is
+   the primary mechanism for Docker Desktop (Windows/macOS) where multicast
+   does not cross the container NAT.
 """
 
 from __future__ import annotations
@@ -40,7 +39,6 @@ import asyncio
 import logging
 import socket
 import urllib.request
-from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,12 +63,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Well-known fallback hostnames ─────────────────────────────────────────────
-# Used when no tagged mDNS records are found (e.g. early dev without Avahi).
-_FALLBACKS: dict[str, str] = {
-    "hardware_comm":  "http://neonbeam-core.local:8000",
-    "machine_vision": "http://neonbeam-lens.local:8001",
-}
 
 # ── Well-known localhost ports to probe ───────────────────────────────────────
 # In port order: (<port>, <service_tag>)
@@ -115,19 +107,38 @@ def _get_lan_ip() -> str:
 
 
 # ── Local service probe (runs in a thread) ────────────────────────────────────
-def _probe_port_blocking(port: int, timeout: float = 1.5) -> bool:
+def _probe_health_blocking(ip: str, port: int, timeout: float = 1.5) -> bool:
     """
-    Synchronous check: is there a NeonBeam service at 127.0.0.1:<port>?
-    Uses urllib so we don't need an extra dependency (httpx etc.).
+    Synchronous HTTP check: is there a NeonBeam service at ip:port/api/health?
     """
     try:
         req = urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/health",
+            f"http://{ip}:{port}/api/health",
             timeout=timeout,
         )
         return req.status == 200
     except Exception:
         return False
+
+
+def _tcp_open(ip: str, port: int, timeout: float = 0.2) -> bool:
+    """
+    Lightweight TCP handshake check — does not send any data.
+    Used for the subnet sweep stage 1 before committing to a full HTTP check.
+    """
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _reverse_hostname(ip: str) -> str:
+    """Try to resolve an IP to its mDNS / DNS hostname.  Falls back to the IP."""
+    try:
+        return socket.gethostbyaddr(ip)[0]   # e.g. 'roto-laser.local'
+    except Exception:
+        return ip
 
 
 async def _probe_local_services() -> list[DiscoveredService]:
@@ -145,7 +156,7 @@ async def _probe_local_services() -> list[DiscoveredService]:
     results: list[DiscoveredService] = []
 
     async def _check(port: int, service_tag: str) -> None:
-        found = await asyncio.to_thread(_probe_port_blocking, port)
+        found = await asyncio.to_thread(_probe_health_blocking, "127.0.0.1", port)
         if found:
             url = f"http://{lan_ip}:{port}"
             logger.info(f"Found {service_tag} locally at {url}")
@@ -154,6 +165,73 @@ async def _probe_local_services() -> list[DiscoveredService]:
             )
 
     await asyncio.gather(*[_check(port, tag) for port, tag in _LOCAL_PORTS])
+    return results
+
+
+# ── /24 subnet scan ───────────────────────────────────────────────────────────
+async def _scan_subnet_services() -> list[DiscoveredService]:
+    """
+    Concurrent /24 subnet sweep to find NeonBeam services on the LAN.
+
+    Stage 1 — TCP handshake across all 254 hosts (semaphore-limited to 50
+               concurrent probes, 0.2 s timeout each).  Only IPs that respond
+               on the target port proceed to stage 2.
+
+    Stage 2 — HTTP /api/health verification on the few survivors.  This
+               confirms the service is actually a NeonBeam endpoint, not just
+               any open port.
+
+    Skips the local machine's own IP (already covered by _probe_local_services).
+    Covers Docker Desktop environments where cross-NAT multicast is unavailable.
+    """
+    lan_ip = _get_lan_ip()
+    if lan_ip == "127.0.0.1":
+        return []   # no LAN interface — can't scan
+
+    subnet_prefix = ".".join(lan_ip.split(".")[:3])   # e.g. "192.168.1"
+    sem = asyncio.Semaphore(50)                        # max 50 simultaneous TCP probes
+
+    # Stage 1: rapid TCP handshake sweep
+    open_hosts: list[tuple[str, int, str]] = []
+    lock = asyncio.Lock()
+
+    async def _tcp_check(ip: str, port: int, service_tag: str) -> None:
+        if ip == lan_ip:
+            return   # skip self — covered by local probe
+        async with sem:
+            reachable = await asyncio.to_thread(_tcp_open, ip, port)
+        if reachable:
+            async with lock:
+                open_hosts.append((ip, port, service_tag))
+
+    await asyncio.gather(*[
+        _tcp_check(f"{subnet_prefix}.{i}", port, tag)
+        for i in range(1, 255)
+        for port, tag in _LOCAL_PORTS
+    ])
+
+    if not open_hosts:
+        return []
+
+    logger.info(f"Subnet scan — {len(open_hosts)} open port(s) found, verifying…")
+
+    # Stage 2: HTTP health check on survivors
+    results: list[DiscoveredService] = []
+    for ip, port, service_tag in open_hosts:
+        ok = await asyncio.to_thread(_probe_health_blocking, ip, port)
+        if ok:
+            hostname = await asyncio.to_thread(_reverse_hostname, ip)
+            display  = hostname if hostname != ip else ip
+            url      = f"http://{ip}:{port}"
+            logger.info(f"Subnet scan — confirmed {service_tag} at {url} ({display})")
+            results.append(
+                DiscoveredService(
+                    name=f"{service_tag} ({display})",
+                    url=url,
+                    service=service_tag,
+                )
+            )
+
     return results
 
 
@@ -210,19 +288,6 @@ def _browse_blocking(timeout_s: float = 3.0) -> list[DiscoveredService]:
     return listener.results
 
 
-def _apply_fallbacks(
-    found: list[DiscoveredService],
-    already_found_tags: set[str],
-) -> list[DiscoveredService]:
-    """
-    Append well-known .local hostname fallbacks for any service not yet discovered
-    via localhost probe or mDNS, so the UI always has something to show.
-    """
-    for tag, url in _FALLBACKS.items():
-        if tag not in already_found_tags:
-            found.append(DiscoveredService(name=f"{tag} (fallback)", url=url, service=tag))
-    return found
-
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/api/health")
@@ -231,37 +296,42 @@ async def health() -> dict:
 
 
 @app.get("/api/discovery", response_model=DiscoveryResponse)
-async def discover(timeout: Optional[float] = 3.0, fallback: bool = True) -> DiscoveryResponse:
+async def discover(timeout: float = 3.0) -> DiscoveryResponse:
     """
-    Discover NeonBeam services using two parallel mechanisms:
+    Discover NeonBeam services using three parallel mechanisms:
 
-    1. Local probe  — checks 127.0.0.1 for each well-known port and returns
-                      the machine's LAN IP so remote clients can reach the service.
-    2. mDNS browse  — listens on the LAN for Avahi/Bonjour-registered services.
+    1. Local probe   — checks 127.0.0.1 for each well-known port and returns
+                       the machine's LAN IP so remote clients can reach the service.
+    2. mDNS browse   — listens on the LAN for Avahi/Bonjour-registered services
+                       (works when NeonBeam services use network_mode: host on Pi).
+    3. Subnet scan   — concurrent TCP sweep of the local /24 followed by HTTP
+                       verification.  Finds any NeonBeam service on the LAN
+                       regardless of mDNS configuration or Docker network mode.
+
+    Returns an empty list if nothing is found.  No fallback hostnames are ever
+    injected — if a service isn’t genuinely reachable it won’t appear here.
 
     Query params
     ------------
-    timeout  : seconds to browse mDNS (local probe always uses 1.5s max)
-    fallback : if true, include well-known .local hostnames for services not found
+    timeout : seconds to browse mDNS  (local probe and subnet scan run concurrently)
     """
-    logger.info(f"Discovery request — mDNS timeout={timeout}s  fallback={fallback}")
+    logger.info(f"Discovery request — mDNS timeout={timeout}s")
 
-    # Run local probe and mDNS browse concurrently
-    local_task = _probe_local_services()
-    mdns_task  = asyncio.to_thread(_browse_blocking, timeout)
+    # Run all three mechanisms concurrently
+    local_results, mdns_results, subnet_results = await asyncio.gather(
+        _probe_local_services(),
+        asyncio.to_thread(_browse_blocking, timeout),
+        _scan_subnet_services(),
+    )
 
-    local_results, mdns_results = await asyncio.gather(local_task, mdns_task)
+    # Merge, deduplicating by URL.  Priority: local > mDNS > subnet scan.
+    seen_urls: set[str] = set()
+    combined: list[DiscoveredService] = []
 
-    # Merge: local results first (most reliable), then any mDNS results that
-    # aren't already covered by a local probe (different host/port = real Pi).
-    local_urls = {svc.url for svc in local_results}
-    extra_mdns = [svc for svc in mdns_results if svc.url not in local_urls]
-    combined   = local_results + extra_mdns
+    for svc in local_results + mdns_results + subnet_results:
+        if svc.url not in seen_urls:
+            seen_urls.add(svc.url)
+            combined.append(svc)
 
-    found_tags = {s.service for s in combined}
-
-    if fallback:
-        combined = _apply_fallbacks(combined, found_tags)
-
-    logger.info(f"Discovery complete — {len(combined)} service(s) returned.")
+    logger.info(f"Discovery complete — {len(combined)} service(s) found.")
     return DiscoveryResponse(found=combined)
